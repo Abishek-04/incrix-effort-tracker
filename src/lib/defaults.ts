@@ -15,7 +15,8 @@ const TEAM: [string, string, Dept, number][] = [
 
 const E = "Engineering", U = "UI/UX Design";
 const RATES: [Dept, string, string, number, string?][] = [
-  ["Content", "Reel / short-form edit (<60s)", "per video", 3], ["Content", "Long-form video edit (5–20 min)", "per video", 10], ["Content", "Long-form video edit (>20 min)", "per video", 16],
+  ["Content", "Reel – basic (cuts, captions, music)", "per video", 2], ["Content", "Reel – standard (b-roll, sound design, motion text)", "per video", 4],
+  ["Content", "Reel – premium (animation / motion-graphics heavy, client brand)", "per video", 7], ["Content", "Long-form video edit (5–20 min)", "per video", 10], ["Content", "Long-form video edit (>20 min)", "per video", 16],
   ["Content", "Reel script / storyboard", "per script", 2], ["Content", "Long-form script", "per script", 5], ["Content", "Shoot / recording session", "per hour", 1.5],
   ["Content", "Thumbnail", "per thumbnail", 1.5], ["Content", "Carousel copy (text)", "per carousel", 2], ["Content", "Caption + hashtags set", "per post", 1],
   ["Content", "Blog / article (800+ words)", "per article", 5], ["Content", "Newsletter / email copy", "per email", 3], ["Content", "Post scheduling & publishing", "per post", 0.5],
