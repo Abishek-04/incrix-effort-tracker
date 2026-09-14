@@ -1,0 +1,33 @@
+{
+  "name": "incrix-effort-tracker",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "next dev",
+    "build": "next build",
+    "start": "next start",
+    "start:lan": "NODE_ENV=production caffeinate -i node server.mjs",
+    "typecheck": "tsc --noEmit",
+    "db:setup": "node --env-file=.env.local scripts/setup-db.ts",
+    "auth:set": "node --env-file=.env.local scripts/set-account.ts"
+  },
+  "dependencies": {
+    "@aws-sdk/client-dynamodb": "^3.1131.0",
+    "@aws-sdk/lib-dynamodb": "^3.1131.0",
+    "jose": "^6.2.12",
+    "next": "16.3.5",
+    "react": "19.3.0",
+    "react-dom": "19.3.0",
+    "zod": "^4.6.5"
+  },
+  "devDependencies": {
+    "@types/node": "^22",
+    "@types/react": "^19",
+    "@types/react-dom": "^19",
+    "typescript": "^5"
+  },
+  "engines": {
+    "node": ">=22.18"
+  }
+}
