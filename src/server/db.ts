@@ -1,90 +1,20 @@
 // Server-only data access. Never import this file from a client component.
-import { DynamoDBClient } from "@aws-sdk/client-dynamodb";
-import {
-  BatchWriteCommand,
-  DeleteCommand,
-  DynamoDBDocumentClient,
-  GetCommand,
-  PutCommand,
-  QueryCommand,
-  ScanCommand,
-  TransactWriteCommand,
-} from "@aws-sdk/lib-dynamodb";
+import { DeleteCommand, GetCommand, PutCommand, TransactWriteCommand } from "@aws-sdk/lib-dynamodb";
 import { defaultRates, defaultTeam } from "@/lib/defaults";
-import { ENGINEERING, UIUX, type Bootstrap, type Entry, type Member, type Rate } from "@/lib/types";
+import type { Insight } from "@/lib/insights";
+import { MAX_HOURS_PER_DAY } from "@/lib/rules";
+import { ENGINEERING, UIUX, type Bootstrap, type Entry, type Job, type Member, type Rate } from "@/lib/types";
+import { hoursLabel } from "@/lib/utils";
+import {
+  TABLE, batchWrite, ddb, entryKey, insightKey, jobKey, memberKey, META_KEY, putRequests, queryAll, rateKey, scanAll, strip, type Item,
+} from "./ddb";
 import { HttpError } from "./http";
+import { applyContribution, detachContribution, getJob } from "./jobs";
 import type { EntryCreate, EntryInput, MemberCreate, MemberPatch, RateCreate, RatePatch } from "./validation";
 
-export const TABLE = process.env.DYNAMODB_TABLE || "incrix-effort-tracker";
 const DATA_VERSION = 3;
-
-function makeClient() {
-  // Some hosts (e.g. Vercel) reserve AWS_* variable names, so APP_AWS_* take precedence when set.
-  // Otherwise the SDK's default chain reads AWS_REGION / AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY.
-  const region = process.env.APP_AWS_REGION || process.env.AWS_REGION || "ap-south-1";
-  const accessKeyId = process.env.APP_AWS_ACCESS_KEY_ID;
-  const secretAccessKey = process.env.APP_AWS_SECRET_ACCESS_KEY;
-  const base = new DynamoDBClient({
-    region,
-    ...(accessKeyId && secretAccessKey ? { credentials: { accessKeyId, secretAccessKey } } : {}),
-  });
-  return DynamoDBDocumentClient.from(base, { marshallOptions: { removeUndefinedValues: true } });
-}
-
-const globalForDb = globalThis as unknown as { __incrixDdb?: DynamoDBDocumentClient };
-export const ddb = (globalForDb.__incrixDdb ??= makeClient());
-
-/* ---------- keys ---------- */
-const META_KEY = { PK: "META", SK: "CONFIG" };
-const memberKey = (id: string) => ({ PK: "TEAM", SK: `MEMBER#${id}` });
-const rateKey = (id: string) => ({ PK: "RATE", SK: `TYPE#${id}` });
-const entryKey = (month: string, id: string) => ({ PK: `ENTRY#${month}`, SK: `ENTRY#${id}` });
-
-type Item = Record<string, unknown>;
-function strip<T>(item: Item): T {
-  const { PK: _pk, SK: _sk, ...rest } = item;
-  return rest as T;
-}
-
-/* ---------- low-level helpers ---------- */
-async function queryAll<T>(pk: string): Promise<T[]> {
-  const out: T[] = [];
-  let ExclusiveStartKey: Item | undefined;
-  do {
-    const r = await ddb.send(
-      new QueryCommand({ TableName: TABLE, KeyConditionExpression: "PK = :pk", ExpressionAttributeValues: { ":pk": pk }, ExclusiveStartKey }),
-    );
-    for (const it of r.Items ?? []) out.push(strip<T>(it));
-    ExclusiveStartKey = r.LastEvaluatedKey;
-  } while (ExclusiveStartKey);
-  return out;
-}
-
-async function scanAll(projectKeysOnly = false): Promise<Item[]> {
-  const out: Item[] = [];
-  let ExclusiveStartKey: Item | undefined;
-  do {
-    const r = await ddb.send(
-      new ScanCommand({ TableName: TABLE, ExclusiveStartKey, ...(projectKeysOnly ? { ProjectionExpression: "PK, SK" } : {}) }),
-    );
-    out.push(...(r.Items ?? []));
-    ExclusiveStartKey = r.LastEvaluatedKey;
-  } while (ExclusiveStartKey);
-  return out;
-}
-
-async function batchWrite(requests: Item[]) {
-  for (let i = 0; i < requests.length; i += 25) {
-    let pending: Item[] | undefined = requests.slice(i, i + 25);
-    for (let attempt = 0; pending?.length; attempt++) {
-      if (attempt > 8) throw new Error("DynamoDB batch write did not complete");
-      const r = await ddb.send(new BatchWriteCommand({ RequestItems: { [TABLE]: pending as never } }));
-      pending = r.UnprocessedItems?.[TABLE] as Item[] | undefined;
-      if (pending?.length) await new Promise((res) => setTimeout(res, 100 * 2 ** attempt));
-    }
-  }
-}
-const putRequests = (items: Item[]) => items.map((Item) => ({ PutRequest: { Item } }));
+// Re-exported so existing server modules keep importing these from here.
+export { ddb, TABLE, insightKey };
 
 /* ---------- seeding ---------- */
 async function seedDefaults(team = defaultTeam(), rates = defaultRates()) {
@@ -103,16 +33,85 @@ async function ensureSeeded() {
 }
 
 /* ---------- bootstrap ---------- */
-export async function getBootstrap(): Promise<Bootstrap> {
+/** `scope` is a member id for personal logins: they only ever see their own record. */
+export async function getBootstrap(scope: string | null = null): Promise<Bootstrap> {
   await ensureSeeded();
   const [team, rates] = await Promise.all([queryAll<Member>("TEAM"), queryAll<Rate>("RATE")]);
-  return { team: team.sort((a, b) => a.order - b.order), rates: rates.sort((a, b) => a.order - b.order) };
+  const visible = scope ? team.filter((m) => m.id === scope) : team;
+  return { team: visible.sort((a, b) => a.order - b.order), rates: rates.sort((a, b) => a.order - b.order) };
+}
+
+export async function getEntry(month: string, id: string): Promise<Entry | null> {
+  const r = await ddb.send(new GetCommand({ TableName: TABLE, Key: entryKey(month, id) }));
+  return r.Item ? strip<Entry>(r.Item) : null;
+}
+
+export async function getMember(id: string): Promise<Member | null> {
+  const r = await ddb.send(new GetCommand({ TableName: TABLE, Key: memberKey(id) }));
+  return r.Item ? strip<Member>(r.Item) : null;
 }
 
 /* ---------- entries ---------- */
-export async function listEntries(month: string): Promise<Entry[]> {
+
+/** What a team member may read: their own department's work, and their own figures. */
+export async function departmentView(memberId: string): Promise<{ own: string; visible: string[] }> {
+  const team = await queryAll<Member>("TEAM");
+  const me = team.find((m) => m.id === memberId);
+  const visible = me ? team.filter((m) => m.dept === me.dept).map((m) => m.id) : [memberId];
+  return { own: memberId, visible };
+}
+
+/** Everything that lets points be worked out, removed — the work itself stays readable. */
+function maskPoints(e: Entry): Entry {
+  const { points: _p, pendingPoints: _pp, share: _s, qty: _q, ...rest } = e;
+  return { ...rest, qty: 0, masked: true };
+}
+
+export async function listEntries(month: string, view: { own: string; visible: string[] } | null = null): Promise<Entry[]> {
   const items = await queryAll<Entry>(`ENTRY#${month}`);
-  return items.sort((a, b) => b.date.localeCompare(a.date) || b.createdAt.localeCompare(a.createdAt));
+  const seen = view ? items.filter((e) => view.visible.includes(e.memberId)).map((e) => (e.memberId === view.own ? e : maskPoints(e))) : items;
+  return seen.sort((a, b) => b.date.localeCompare(a.date) || b.createdAt.localeCompare(a.createdAt));
+}
+
+/**
+ * Deliverables logged across the whole studio in the last fortnight that nobody has shared yet.
+ * Everyone sees these, whatever their department — collaboration here crosses department lines,
+ * and joining a job needs to know what it is worth.
+ */
+export async function joinableEntries(from: string, to: string): Promise<Entry[]> {
+  const months = [...new Set([from.slice(0, 7), to.slice(0, 7)])];
+  const pages = await Promise.all(months.map((m) => queryAll<Entry>(`ENTRY#${m}`)));
+  return pages
+    .flat()
+    .filter((e) => !e.jobId && e.date >= from && e.date <= to)
+    .sort((a, b) => b.date.localeCompare(a.date))
+    .slice(0, 120);
+}
+
+/**
+ * Month totals for the whole studio, with nothing attributable to a person.
+ * Everyone signed in may see these; only administrators see the breakdown behind them.
+ */
+export async function teamSummary(month: string) {
+  const [entries, team, rates] = await Promise.all([queryAll<Entry>(`ENTRY#${month}`), queryAll<Member>("TEAM"), queryAll<Rate>("RATE")]);
+  const rateById = new Map(rates.map((r) => [r.id, r]));
+  const active = team.filter((m) => m.active);
+  const points = entries.reduce((a, e) => a + (e.points !== undefined ? e.points : (rateById.get(e.typeId) ? (e.qty || 1) * rateById.get(e.typeId)!.rate : 0)), 0);
+  return {
+    month,
+    points: Math.round(points * 10) / 10,
+    target: active.reduce((a, m) => a + m.target, 0),
+    entries: entries.length,
+    hours: Math.round(entries.reduce((a, e) => a + (e.hours ?? 0), 0) * 10) / 10,
+    activeMembers: active.length,
+    contributors: new Set(entries.map((e) => e.memberId)).size,
+  };
+}
+
+/** Entries for one member across a date range, read month by month. */
+export async function listMemberEntries(memberId: string, months: string[]): Promise<Entry[]> {
+  const pages = await Promise.all(months.map((m) => queryAll<Entry>(`ENTRY#${m}`)));
+  return pages.flat().filter((e) => e.memberId === memberId).sort((a, b) => a.date.localeCompare(b.date));
 }
 
 async function resolveRefs(input: EntryInput) {
@@ -123,39 +122,91 @@ async function resolveRefs(input: EntryInput) {
   if (!m.Item) throw new HttpError(400, "Selected team member no longer exists");
   if (!r.Item) throw new HttpError(400, "Selected work type no longer exists");
   const rate = strip<Rate>(r.Item);
-  return { memberName: String(m.Item.name), typeName: rate.type, dept: rate.dept };
+  return { memberName: String(m.Item.name), typeName: rate.type, dept: rate.dept, rate };
 }
 
-export async function createEntry(input: EntryCreate): Promise<Entry> {
-  const refs = await resolveRefs(input);
+/** Work types priced per hour earn by the clock, so their quantity is the time spent — never a separate claim. */
+export const isHourly = (rate: Rate) => /per hour/i.test(rate.unit);
+const quantityFor = (rate: Rate, input: EntryInput) => (isHourly(rate) && (input.hours ?? 0) > 0 ? input.hours : input.qty);
+
+/**
+ * Contributions inherit the deliverable from their job card, then take their share of its points.
+ * A card's own work type wins over whatever the form sent.
+ */
+async function withJobSplit(entry: Entry, jobId: string | undefined, previousJobId?: string): Promise<Entry> {
+  if (previousJobId && previousJobId !== jobId) await detachContribution(previousJobId, entry.id);
+  if (!jobId) {
+    const { jobId: _j, points: _p, pendingPoints: _pp, share: _s, ...plain } = entry;
+    return plain as Entry;
+  }
+  const job = await getJob(jobId);
+  if (!job) throw new HttpError(400, "That job card no longer exists");
+  const linked: Entry = { ...entry, jobId, typeId: job.typeId, typeName: job.typeName, dept: job.dept, qty: 1 };
+  const { points, pendingPoints, share } = await applyContribution(jobId, linked);
+  return { ...linked, points, pendingPoints, share };
+}
+
+/** Rule 2 — a day has a limit, so hours can't be invented to inflate points or a card share. */
+async function assertDayWithinLimit(input: EntryInput, exceptId?: string) {
+  const hours = input.hours ?? 0;
+  if (hours <= 0) return;
+  const sameDay = (await listEntries(input.date.slice(0, 7)))
+    .filter((e) => e.memberId === input.memberId && e.date === input.date && e.id !== exceptId);
+  const already = sameDay.reduce((a, e) => a + (e.hours ?? 0), 0);
+  if (already + hours > MAX_HOURS_PER_DAY) {
+    throw new HttpError(
+      400,
+      `That would put ${hoursLabel(already + hours)} on ${input.date} — a day holds ${MAX_HOURS_PER_DAY} hours. ` +
+        `${hoursLabel(already)} is already logged.`,
+    );
+  }
+}
+
+export async function createEntry(input: EntryCreate, scope: string | null = null): Promise<Entry> {
+  if (scope && input.memberId !== scope) throw new HttpError(403, "You can only log work against your own name");
+  const { rate, ...refs } = await resolveRefs(input);
+  await assertDayWithinLimit(input);
   const now = new Date().toISOString();
-  const entry: Entry = {
+  const draft: Entry = {
     id: input.id ?? crypto.randomUUID(),
     date: input.date, memberId: input.memberId, typeId: input.typeId,
-    desc: input.desc, client: input.client ?? "", qty: input.qty, hours: input.hours ?? null, status: input.status,
+    desc: input.desc, client: input.client ?? "", qty: quantityFor(rate, input), hours: input.hours ?? null, startTime: input.startTime, status: input.status,
     ...refs, createdAt: now, updatedAt: now,
   };
+  let entry: Entry;
+  try {
+    entry = await withJobSplit(draft, input.jobId);
+  } catch (e) {
+    // The card must not keep a contribution for an entry that was never written.
+    if (input.jobId) await detachContribution(input.jobId, draft.id);
+    throw e;
+  }
   try {
     await ddb.send(
       new PutCommand({ TableName: TABLE, Item: { ...entryKey(entry.date.slice(0, 7), entry.id), ...entry }, ConditionExpression: "attribute_not_exists(PK)" }),
     );
   } catch (e) {
+    // Never leave the card holding a contribution whose entry wasn't written.
+    if (entry.jobId) await detachContribution(entry.jobId, entry.id);
     if ((e as Error).name === "ConditionalCheckFailedException") throw new HttpError(409, "Entry already exists");
     throw e;
   }
   return entry;
 }
 
-export async function updateEntry(id: string, prevMonth: string, input: EntryInput): Promise<Entry> {
+export async function updateEntry(id: string, prevMonth: string, input: EntryInput, scope: string | null = null): Promise<Entry> {
   const old = await ddb.send(new GetCommand({ TableName: TABLE, Key: entryKey(prevMonth, id) }));
   if (!old.Item) throw new HttpError(404, "Entry not found — it may have been deleted");
-  const refs = await resolveRefs(input);
   const prev = strip<Entry>(old.Item);
-  const entry: Entry = {
+  if (scope && (prev.memberId !== scope || input.memberId !== scope)) throw new HttpError(403, "You can only change your own entries");
+  const { rate, ...refs } = await resolveRefs(input);
+  await assertDayWithinLimit(input, id);
+  const draft: Entry = {
     ...prev, date: input.date, memberId: input.memberId, typeId: input.typeId,
-    desc: input.desc, client: input.client ?? "", qty: input.qty, hours: input.hours ?? null, status: input.status,
+    desc: input.desc, client: input.client ?? "", qty: quantityFor(rate, input), hours: input.hours ?? null, startTime: input.startTime, status: input.status,
     ...refs, updatedAt: new Date().toISOString(),
   };
+  const entry = await withJobSplit(draft, input.jobId, prev.jobId);
   const newMonth = entry.date.slice(0, 7);
   const Item = { ...entryKey(newMonth, id), ...entry };
   if (newMonth === prevMonth) {
@@ -173,10 +224,22 @@ export async function updateEntry(id: string, prevMonth: string, input: EntryInp
   return entry;
 }
 
-export async function deleteEntry(id: string, month: string): Promise<Entry> {
-  const r = await ddb.send(new DeleteCommand({ TableName: TABLE, Key: entryKey(month, id), ReturnValues: "ALL_OLD" }));
-  if (!r.Attributes) throw new HttpError(404, "Entry not found");
-  return strip<Entry>(r.Attributes);
+export async function deleteEntry(id: string, month: string, scope: string | null = null): Promise<Entry> {
+  try {
+    const r = await ddb.send(
+      new DeleteCommand({
+        TableName: TABLE, Key: entryKey(month, id), ReturnValues: "ALL_OLD",
+        ...(scope ? { ConditionExpression: "memberId = :mid", ExpressionAttributeValues: { ":mid": scope } } : {}),
+      }),
+    );
+    if (!r.Attributes) throw new HttpError(404, "Entry not found");
+    const removed = strip<Entry>(r.Attributes);
+    if (removed.jobId) await detachContribution(removed.jobId, removed.id);
+    return removed;
+  } catch (e) {
+    if ((e as Error).name === "ConditionalCheckFailedException") throw new HttpError(403, "You can only delete your own entries");
+    throw e;
+  }
 }
 
 /* ---------- team ---------- */
@@ -244,16 +307,20 @@ export async function deleteRate(id: string) {
 /* ---------- backup / restore / reset ---------- */
 export async function exportAll() {
   const items = await scanAll();
-  const team: Member[] = [], rates: Rate[] = [], entries: Entry[] = [];
+  const team: Member[] = [], rates: Rate[] = [], entries: Entry[] = [], insights: Insight[] = [], jobs: Job[] = [];
   for (const it of items) {
     if (it.PK === "TEAM") team.push(strip<Member>(it));
     else if (it.PK === "RATE") rates.push(strip<Rate>(it));
     else if (String(it.PK).startsWith("ENTRY#")) entries.push(strip<Entry>(it));
+    else if (it.PK === "JOB") jobs.push(strip<Job>(it));
+    else if (String(it.PK).startsWith("INSIGHT#")) insights.push(strip<Insight>(it));
   }
   return {
     app: "incrix-effort-tracker", version: DATA_VERSION, exportedAt: new Date().toISOString(),
     team: team.sort((a, b) => a.order - b.order), rates: rates.sort((a, b) => a.order - b.order),
     entries: entries.sort((a, b) => a.date.localeCompare(b.date)),
+    insights: insights.sort((a, b) => a.period.localeCompare(b.period)),
+    jobs: jobs.sort((a, b) => a.createdAt.localeCompare(b.createdAt)),
   };
 }
 
@@ -263,13 +330,15 @@ async function wipeAll() {
   await batchWrite(keys.map((Key) => ({ DeleteRequest: { Key } })));
 }
 
-export async function restoreAll(data: { team: Member[]; rates: Rate[]; entries: Entry[] }) {
+export async function restoreAll(data: { team: Member[]; rates: Rate[]; entries: Entry[]; insights?: Insight[]; jobs?: Job[] }) {
   await wipeAll();
   await batchWrite(
     putRequests([
       ...data.team.map((m) => ({ ...memberKey(m.id), ...m })),
       ...data.rates.map((r) => ({ ...rateKey(r.id), ...r })),
       ...data.entries.map((e) => ({ ...entryKey(e.date.slice(0, 7), e.id), ...e })),
+      ...(data.insights ?? []).map((i) => ({ ...insightKey(i.memberId, i.kind, i.period), ...i })),
+      ...(data.jobs ?? []).map((j) => ({ ...jobKey(j.id), ...j })),
     ]),
   );
   await ddb.send(new PutCommand({ TableName: TABLE, Item: { ...META_KEY, version: DATA_VERSION, restoredAt: new Date().toISOString() } }));
@@ -282,13 +351,18 @@ export async function resetAll() {
 }
 
 /** Converts a backup from this app, or from the original single-file HTML tracker, into records. */
-export function normalizeBackup(raw: unknown): { team: Member[]; rates: Rate[]; entries: Entry[] } {
+export function normalizeBackup(raw: unknown): { team: Member[]; rates: Rate[]; entries: Entry[]; insights: Insight[]; jobs: Job[] } {
   const d = raw as Record<string, unknown>;
   if (!d || !Array.isArray(d.team) || !Array.isArray(d.entries)) throw new HttpError(400, "That file isn't a valid tracker backup");
   const now = new Date().toISOString();
 
   // Current format: records already carry ids.
-  if (Array.isArray(d.rates)) return { team: d.team as Member[], rates: d.rates as Rate[], entries: d.entries as Entry[] };
+  if (Array.isArray(d.rates))
+    return {
+      team: d.team as Member[], rates: d.rates as Rate[], entries: d.entries as Entry[],
+      insights: Array.isArray(d.insights) ? (d.insights as Insight[]) : [],
+      jobs: Array.isArray(d.jobs) ? (d.jobs as Job[]) : [],
+    };
 
   // Legacy HTML format: names instead of ids, "points" instead of "rates".
   type LegacyMember = { name: string; role?: string; dept: Member["dept"]; target?: number; active?: boolean };
@@ -320,5 +394,5 @@ export function normalizeBackup(raw: unknown): { team: Member[]; rates: Rate[]; 
       desc: e.desc ?? "", client: e.client ?? "", qty: Number(e.qty) || 1, hours: e.hours ?? null, status: e.status ?? "Done",
       createdAt: now, updatedAt: now,
     }));
-  return { team, rates, entries };
+  return { team, rates, entries, insights: [], jobs: [] };
 }

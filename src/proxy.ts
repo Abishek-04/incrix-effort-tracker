@@ -1,5 +1,5 @@
 import { NextResponse, type NextRequest } from "next/server";
-import { ADMIN_PAGES, SESSION_COOKIE, verifySession } from "@/lib/session";
+import { ADMIN_PAGES, MEMBER_BLOCKED_PAGES, SESSION_COOKIE, SHARED_BLOCKED_PAGES, homePageFor, verifySession } from "@/lib/session";
 
 // First line of defence: every page and API needs a valid signed session.
 // API routes and server layouts check again (including revocation), so this is never the only check.
@@ -19,8 +19,13 @@ export async function proxy(req: NextRequest) {
     return res;
   }
 
-  if (session.role !== "admin" && ADMIN_PAGES.some((p) => pathname === p || pathname.startsWith(`${p}/`))) {
-    return NextResponse.redirect(new URL("/dashboard", req.url));
+  const blocked = [
+    ...(session.role === "admin" ? [] : ADMIN_PAGES),
+    ...(session.role === "member" ? MEMBER_BLOCKED_PAGES : []),
+    ...(session.role === "team" ? SHARED_BLOCKED_PAGES : []),
+  ];
+  if (blocked.some((p) => pathname === p || pathname.startsWith(`${p}/`))) {
+    return NextResponse.redirect(new URL(homePageFor(session.role), req.url));
   }
   return NextResponse.next();
 }

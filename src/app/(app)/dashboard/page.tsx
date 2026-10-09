@@ -1,17 +1,27 @@
 "use client";
 
+import Link from "next/link";
 import { useRouter } from "next/navigation";
-import { useState } from "react";
+import { useEffect, useState } from "react";
+import { useAuth } from "@/components/AuthProvider";
 import { useData, useMonth } from "@/components/DataProvider";
 import { Icon, type IconName } from "@/components/Icon";
 import { Avatar, EmptyState, LoadError, MonthNav, PageHead, PerfPill, SkeletonRows } from "@/components/ui";
+import { api, type TeamSummary } from "@/lib/api";
 import { DEPTS, UIUX } from "@/lib/types";
-import { daysIn, dateLabel, fmt, monthLabel, perfStatus, shiftMonth, sum, todayISO, workingDays, workingDaysBetween } from "@/lib/utils";
+import { looksLikeSameWork } from "@/lib/rules";
+import { daysIn, dateLabel, fmt, hoursLabel, isQuickClaim, monthLabel, perfStatus, shiftMonth, sum, todayISO, typicalHoursOf, workingDays, workingDaysBetween } from "@/lib/utils";
 
 type SortKey = "name" | "dept" | "p" | "pct" | "days";
 
 export default function DashboardPage() {
-  const { team, rateById, viewMonth, pts, memberName } = useData();
+  const { isAdmin } = useAuth();
+  // Only an administrator sees the team person by person; everyone else sees their own progress.
+  return isAdmin ? <TeamDashboard /> : <OwnDashboard />;
+}
+
+function TeamDashboard() {
+  const { team, rateById, jobs, viewMonth, pts, memberName } = useData();
   const router = useRouter();
   const { entries: es, loading, error, retry } = useMonth(viewMonth);
   const prevYM = shiftMonth(viewMonth, -1);
@@ -65,6 +75,40 @@ export default function DashboardPage() {
 
   const attention: { key: string; name: string; icon: IconName; cls: string; text: string }[] = [];
   es.filter((e) => e.status === "Blocked").forEach((e) => attention.push({ key: `b${e.id}`, name: memberName(e), icon: "warn", cls: "bad", text: `Blocked: ${e.desc}` }));
+  // A whole deliverable logged in a fraction of the time it normally takes.
+  es.filter((e) => isQuickClaim(e, rateById.get(e.typeId))).forEach((e) => {
+    const typical = typicalHoursOf(rateById.get(e.typeId)!);
+    attention.push({
+      key: `q${e.id}`, name: memberName(e), icon: "clock", cls: "warn",
+      text: `${rateById.get(e.typeId)?.type.split(" (")[0]} logged in ${hoursLabel(e.hours ?? 0)} — usually ${hoursLabel(typical ?? 0)}`,
+    });
+  });
+  // The same deliverable logged twice by different people, never joined onto one card.
+  const seen = new Set<string>();
+  es.forEach((a) => {
+    if (a.jobId || seen.has(a.id)) return;
+    const twin = es.find((b) => !seen.has(b.id) && looksLikeSameWork(a, b, rateById.get(a.typeId)));
+    if (!twin) return;
+    seen.add(a.id);
+    seen.add(twin.id);
+    const together = fmt(pts(a) + pts(twin));
+    const work = rateById.get(a.typeId)?.type.split(" (")[0];
+    const when = `${dateLabel(a.date, { day: "numeric", month: "short" })} and ${dateLabel(twin.date, { day: "numeric", month: "short" })}`;
+    attention.push({
+      key: `d${a.id}`, name: memberName(a), icon: "layers", cls: "warn",
+      text: a.memberId === twin.memberId
+        ? `${work} logged twice, on ${when} — ${together} pts. One piece of work split in two?`
+        : `${work} logged separately by ${memberName(a)} and ${memberName(twin)} — ${together} pts for what may be one job`,
+    });
+  });
+
+  // Cards holding points that count for nobody until they're confirmed.
+  jobs.filter((j) => !j.confirmed && j.contributions.length).forEach((j) => {
+    attention.push({
+      key: `c${j.id}`, name: j.contributions[0].memberName, icon: "clock", cls: "warn",
+      text: `“${j.title}” — ${fmt(j.points)} pts waiting on your confirmation`,
+    });
+  });
   if (!prev.loading) {
     active.forEach((m) => {
       const mine = es.filter((e) => e.memberId === m.id);
@@ -80,6 +124,16 @@ export default function DashboardPage() {
       }
     });
   }
+
+  // The same observation about the same person is one line with a count, not five lines.
+  const grouped: typeof attention = [];
+  const counts = new Map<string, number>();
+  for (const a of attention) {
+    const key = `${a.name}|${a.text}`;
+    counts.set(key, (counts.get(key) ?? 0) + 1);
+    if (counts.get(key) === 1) grouped.push(a);
+  }
+  const attentionRows = grouped.map((a) => ({ ...a, times: counts.get(`${a.name}|${a.text}`) ?? 1 }));
 
   return (
     <>
@@ -193,28 +247,146 @@ export default function DashboardPage() {
           </div>
           <div className="card span-all">
             <div className="card-h">
-              <div><h2>Needs attention</h2><p>{isCur ? "Blocked work and members who haven't logged recently" : "Blocked work and members with no entries"}</p></div>
-              {attention.length > 0 && <span className="pill bad">{attention.length}</span>}
+              <div><h2>Needs attention</h2><p>Blocked work, work that looks logged twice, cards waiting on you, and {isCur ? "members who haven't logged recently" : "members with no entries"}</p></div>
+              {attentionRows.length > 0 && <span className="pill bad">{attentionRows.length}</span>}
             </div>
-            {attention.length ? (
+            {attentionRows.length ? (
               <div className="alist">
-                {attention.slice(0, 7).map((a) => (
+                {attentionRows.slice(0, 7).map((a) => (
                   <div key={a.key} className="aitem">
                     <Avatar name={a.name} sm />
                     <div className="grow">
-                      <b style={{ display: "block", fontWeight: 600 }}>{a.name}</b>
-                      <div className="meta" style={{ margin: 0 }}>
-                        <span className={`pill ${a.cls}`} style={{ maxWidth: "100%", overflow: "hidden", textOverflow: "ellipsis" }}><Icon name={a.icon} size={12} />{a.text}</span>
-                      </div>
+                      <b style={{ display: "block", fontWeight: 600 }}>{a.name}{a.times > 1 && <span className="muted" style={{ fontWeight: 400 }}> · {a.times} entries</span>}</b>
+                      <div className={`aline ${a.cls}`}><Icon name={a.icon} size={13} /><span>{a.text}</span></div>
                     </div>
                   </div>
                 ))}
-                {attention.length > 7 && <div className="aitem muted" style={{ fontSize: 12.5 }}>+ {attention.length - 7} more</div>}
+                {attentionRows.length > 7 && <div className="aitem muted" style={{ fontSize: 12.5 }}>+ {attentionRows.length - 7} more</div>}
               </div>
             ) : (
               <EmptyState icon="checkc" title="All clear">Nothing blocked and everyone is logging regularly.</EmptyState>
             )}
           </div>
+        </div>
+      </div>
+    </>
+  );
+}
+
+/* ---------------- What a member sees ---------------- */
+function OwnDashboard() {
+  const { user, isMember } = useAuth();
+  const { team, viewMonth, pts } = useData();
+  const { entries, loading, error, retry } = useMonth(viewMonth);
+  const [summary, setSummary] = useState<TeamSummary | null>(null);
+
+  useEffect(() => {
+    let live = true;
+    api.summary(viewMonth).then((s) => live && setSummary(s)).catch(() => {});
+    return () => { live = false; };
+  }, [viewMonth]);
+
+  const me = isMember ? team.find((m) => m.id === user.memberId) : undefined;
+  const mine = me ? entries.filter((e) => e.memberId === me.id) : [];
+  const today = todayISO(), isCur = viewMonth === today.slice(0, 7);
+  const wdT = workingDays(viewMonth, false), wdE = workingDays(viewMonth, true), pace = wdT ? wdE / wdT : 0;
+  const points = sum(mine, pts), target = me?.target ?? 0;
+  const perf = perfStatus(points, target, viewMonth);
+  const daysLogged = new Set(mine.map((e) => e.date)).size;
+  const hours = sum(mine, (e) => e.hours ?? 0);
+  const lastLogged = mine.map((e) => e.date).sort().pop();
+  const studioPct = summary?.target ? Math.min(100, (summary.points / summary.target) * 100) : 0;
+
+  return (
+    <>
+      <PageHead
+        title={me ? `${me.name.split(" ")[0]}’s progress` : "Studio progress"}
+        sub={me
+          ? `${monthLabel(viewMonth)} · ${wdE} of ${wdT} working days elapsed`
+          : "Totals for the whole studio. Sign in with your own login to see your own progress."}
+        actions={<MonthNav />}
+      />
+      {error && <LoadError message={error} onRetry={retry} />}
+
+      {me && (
+        <div className="kpis">
+          <div className="card kpi">
+            <div className="k-h"><span className="k-i"><Icon name="trend" size={16} /></span>Your points</div>
+            <div className="k-v">{loading ? "—" : fmt(points)}<small> / {fmt(target)}</small></div>
+            <div className="progress" style={{ marginBottom: 8 }} data-tip={`Marker = where you'd be on pace today (${fmt(target * pace)} pts)`}>
+              <i className={perf.cls} style={{ width: `${target ? Math.min(100, (points / target) * 100) : 0}%` }} />
+              {wdE > 0 && <span className="pace" style={{ left: `${pace * 100}%` }} />}
+            </div>
+            <div className="k-f"><PerfPill perf={perf} /> {fmt(Math.max(0, target * pace - points))} pts behind pace</div>
+          </div>
+          <div className="card kpi">
+            <div className="k-h"><span className="k-i"><Icon name="file" size={16} /></span>What you logged</div>
+            <div className="k-v">{mine.length}<small> entries</small></div>
+            <div className="k-f">{fmt(hours)} hrs · {fmt(mine.length ? points / mine.length : 0)} pts per entry</div>
+          </div>
+          <div className="card kpi">
+            <div className="k-h"><span className="k-i"><Icon name="grid" size={16} /></span>Days logged</div>
+            <div className="k-v">{daysLogged}<small> / {wdE || wdT}</small></div>
+            <div className="k-f">
+              {lastLogged
+                ? `Last logged ${dateLabel(lastLogged, { day: "numeric", month: "short" })}`
+                : isCur ? "Nothing logged this month yet" : "No entries this month"}
+            </div>
+          </div>
+          <div className="card kpi">
+            <div className="k-h"><span className="k-i"><Icon name="target" size={16} /></span>To reach your target</div>
+            <div className="k-v">{fmt(Math.max(0, target - points))}<small> pts</small></div>
+            <div className="k-f">{isCur ? `${Math.max(0, wdT - wdE)} working days left · ${fmt(Math.max(0, (target - points) / Math.max(1, wdT - wdE)))} pts a day` : "Month finished"}</div>
+          </div>
+        </div>
+      )}
+
+      <div className="cols-2">
+        <div className="card">
+          <div className="card-h"><div><h2>The studio this month</h2><p>Everyone&apos;s work added together. Individual figures stay with the person and the administrator.</p></div></div>
+          <div className="card-b">
+            {summary ? (
+              <>
+                <div className="statrow">
+                  <span>Points logged</span>
+                  <span><b>{fmt(summary.points)}</b> of {fmt(summary.target)}</span>
+                </div>
+                <div className="progress" data-tip={`Marker = where the studio would be on pace today`}>
+                  <i className={studioPct >= pace * 90 ? "ok" : studioPct >= pace * 60 ? "warn" : "bad"} style={{ width: `${studioPct}%` }} />
+                  {wdE > 0 && <span className="pace" style={{ left: `${pace * 100}%` }} />}
+                </div>
+                <div className="statgrid">
+                  <div><b>{summary.entries}</b>Entries</div>
+                  <div><b>{fmt(summary.hours)}</b>Hours</div>
+                  <div><b>{summary.contributors}/{summary.activeMembers}</b>Logging</div>
+                </div>
+              </>
+            ) : <SkeletonRows rows={2} height={28} />}
+          </div>
+        </div>
+
+        <div className="card">
+          <div className="card-h"><div><h2>Your recent work</h2><p>The last few entries you logged this month</p></div></div>
+          {loading ? <SkeletonRows rows={3} /> : mine.length ? (
+            <div className="alist">
+              {[...mine].sort((a, b) => b.date.localeCompare(a.date)).slice(0, 6).map((e) => (
+                <div key={e.id} className="aitem">
+                  <div className="grow" style={{ minWidth: 0 }}>
+                    <b style={{ display: "block", fontWeight: 600 }}>{e.desc}</b>
+                    <div className="aline">
+                      <Icon name="clock" size={13} />
+                      <span>{dateLabel(e.date, { day: "numeric", month: "short" })} · {e.typeName}{e.client ? ` · ${e.client}` : ""}</span>
+                    </div>
+                  </div>
+                  <div style={{ whiteSpace: "nowrap" }}><b>{fmt(pts(e))}</b> <span className="muted">pts</span></div>
+                </div>
+              ))}
+            </div>
+          ) : (
+            <EmptyState icon="log" title="Nothing logged yet" action={<Link className="btn" href="/log"><Icon name="plus" size={16} />Log your work</Link>}>
+              Your points appear here as soon as you log something.
+            </EmptyState>
+          )}
         </div>
       </div>
     </>

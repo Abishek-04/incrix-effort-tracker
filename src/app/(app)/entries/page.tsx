@@ -9,11 +9,18 @@ import { Icon } from "@/components/Icon";
 import { Avatar, EmptyState, LoadError, MonthNav, PageHead, SkeletonRows, StatusPill } from "@/components/ui";
 import { useUI } from "@/components/UIProvider";
 import { DEPTS, STATUSES, UIUX, type Entry } from "@/lib/types";
-import { csvDownload, dateLabel, fmt, monthLabel, sum } from "@/lib/utils";
+import { isPending, pendingPointsOf } from "@/lib/rules";
+import { csvDownload, dateLabel, fmt, hoursInput, hoursLabel, logLagDays, monthLabel, stampLabel, sum } from "@/lib/utils";
 
-type SortKey = "date" | "member" | "type" | "qty" | "pts" | "hours" | "status";
+type SortKey = "date" | "member" | "type" | "qty" | "pts" | "hours" | "status" | "logged";
 const FILTER_KEYS = ["member", "dept", "status", "q", "date"] as const;
 type FilterKey = (typeof FILTER_KEYS)[number];
+
+/** "Same day" or "3 days later" — how long after the work it reached the log. */
+function lagLabel(e: Entry) {
+  const lag = logLagDays(e.date, e.createdAt);
+  return lag === 0 ? "Same day" : lag === 1 ? "Next day" : `${lag} days later`;
+}
 
 export default function EntriesPage() {
   return (
@@ -24,7 +31,7 @@ export default function EntriesPage() {
 }
 
 function Entries() {
-  const { team, memberById, rateById, viewMonth, setViewMonth, pts, memberName } = useData();
+  const { team, memberById, rateById, jobById, viewMonth, setViewMonth, pts, memberName } = useData();
   const { toast } = useUI();
   const params = useSearchParams();
   const { entries, loading, error, retry } = useMonth(viewMonth);
@@ -56,13 +63,19 @@ function Entries() {
       (!q || [e.desc, e.client, typeName(e), memberName(e)].join(" ").toLowerCase().includes(q)),
   );
   const val = (e: Entry): string | number =>
-    sort.k === "pts" ? pts(e) : sort.k === "qty" ? e.qty : sort.k === "hours" ? (e.hours ?? -1)
+    sort.k === "pts" ? pts(e) : sort.k === "qty" ? e.qty : sort.k === "hours" ? (e.hours ?? -1) : sort.k === "logged" ? e.createdAt
       : sort.k === "member" ? memberName(e).toLowerCase() : sort.k === "type" ? typeName(e).toLowerCase() : sort.k === "status" ? e.status : e.date;
   const sorted = [...filtered].sort((a, b) => {
     const x = val(a), y = val(b);
     return (x < y ? -1 : x > y ? 1 : 0) * sort.dir || b.date.localeCompare(a.date) || b.createdAt.localeCompare(a.createdAt);
   });
   const shown = sorted.slice(0, limit);
+  // A member sees their department's work; the points on it belong to the person who did it.
+  const someoneElses = entries.some((e) => e.masked);
+  // Without the full team list, the member filter is built from the names actually on screen.
+  const filterMembers = team.length > 1
+    ? team.map((m) => ({ id: m.id, name: m.name }))
+    : [...new Map(entries.map((e) => [e.memberId, { id: e.memberId, name: memberName(e) }])).values()].sort((a, b) => a.name.localeCompare(b.name));
 
   const chips: [FilterKey, string][] = [];
   if (f.date) chips.push(["date", dateLabel(f.date)]);
@@ -85,15 +98,23 @@ function Entries() {
     if (!sorted.length) return toast("Nothing to export for these filters", { error: true });
     const rows = sorted.map((e) => {
       const r = rateById.get(e.typeId);
-      return [e.date, memberName(e), e.dept, typeName(e), r?.group ?? "", e.desc, e.client, e.qty, pts(e), e.hours ?? "", e.status];
+      return [
+        e.date, e.startTime ?? "", memberName(e), e.dept, typeName(e), r?.group ?? "", e.desc, e.client,
+        e.masked ? "" : e.qty, e.masked ? "" : pts(e),
+        e.hours ?? "", e.hours == null ? "" : hoursLabel(e.hours), e.jobId ? jobById.get(e.jobId)?.title ?? "Job card" : "",
+        e.share === undefined ? "" : `${Math.round(e.share * 100)}%`, e.status, stampLabel(e.createdAt), logLagDays(e.date, e.createdAt),
+      ];
     });
-    csvDownload(`incrix-log-${viewMonth}.csv`, [["Date", "Member", "Department", "Work Type", "Group", "Description", "Client", "Qty", "Points", "Hours", "Status"], ...rows]);
+    csvDownload(`incrix-log-${viewMonth}.csv`, [
+      ["Date", "Started at", "Member", "Department", "Work Type", "Group", "Description", "Client", "Qty", "Points", "Hours", "Time spent", "Job card", "Share", "Status", "Logged at", "Logged after (days)"],
+      ...rows,
+    ]);
     toast(`Exported ${sorted.length} entries`);
   };
 
   return (
     <>
-      <PageHead title="Entries" sub={`All work logged in ${monthLabel(viewMonth)}.`} actions={<MonthNav onChange={() => f.date && setFilter({ date: "" })} />} />
+      <PageHead title="Entries" sub={someoneElses ? `Your department's work in ${monthLabel(viewMonth)}. Points shown are your own.` : `All work logged in ${monthLabel(viewMonth)}.`} actions={<MonthNav onChange={() => f.date && setFilter({ date: "" })} />} />
       {error && <LoadError message={error} onRetry={retry} />}
       <div className="card">
         <div className="toolbar">
@@ -103,7 +124,7 @@ function Entries() {
           </div>
           <select value={f.member} onChange={(e) => setFilter({ member: e.target.value })} aria-label="Filter by member">
             <option value="">All members</option>
-            {team.map((m) => <option key={m.id} value={m.id}>{m.name}</option>)}
+            {filterMembers.map((m) => <option key={m.id} value={m.id}>{m.name}</option>)}
           </select>
           <select value={f.dept} onChange={(e) => setFilter({ dept: e.target.value })} aria-label="Filter by department">
             <option value="">All departments</option>
@@ -120,7 +141,8 @@ function Entries() {
 
         <div className="toolbar" style={{ padding: "10px 20px", gap: 8, background: "var(--surface-2)" }}>
           <span style={{ fontSize: 13, color: "var(--ink-2)" }}>
-            <b style={{ color: "var(--ink)" }}>{sorted.length}</b> {sorted.length === 1 ? "entry" : "entries"} · <b style={{ color: "var(--ink)" }}>{fmt(sum(sorted, pts))}</b> pts · {fmt(sum(sorted, (e) => e.hours ?? 0))} hrs
+            <b style={{ color: "var(--ink)" }}>{sorted.length}</b> {sorted.length === 1 ? "entry" : "entries"} ·{" "}
+            <b style={{ color: "var(--ink)" }}>{fmt(sum(sorted, pts))}</b> {someoneElses ? "of your pts" : "pts"} · {fmt(sum(sorted, (e) => e.hours ?? 0))} hrs
           </span>
           {chips.length > 0 && (
             <>
@@ -138,11 +160,11 @@ function Entries() {
         {loading ? <SkeletonRows rows={8} /> : sorted.length ? (
           <>
             <div className="tablewrap">
-              <table className="t">
+              <table className="t entries">
                 <thead>
                   <tr>
                     <Th k="date" label="Date" /><Th k="member" label="Member" /><th>Work</th><Th k="type" label="Type" />
-                    <Th k="qty" label="Qty" num /><Th k="pts" label="Points" num /><Th k="hours" label="Hrs" num /><Th k="status" label="Status" />
+                    <Th k="qty" label="Qty" num /><Th k="pts" label="Points" num /><Th k="hours" label="Time" num /><Th k="status" label="Status" /><Th k="logged" label="Logged" />
                     <th className="act"><span className="sr">Actions</span></th>
                   </tr>
                 </thead>
@@ -151,22 +173,45 @@ function Entries() {
                     const r = rateById.get(e.typeId);
                     return (
                       <tr key={e.id}>
-                        <td style={{ whiteSpace: "nowrap" }}><b>{dateLabel(e.date, { day: "numeric", month: "short" })}</b><div className="meta">{dateLabel(e.date, { weekday: "short" })}</div></td>
+                        <td style={{ whiteSpace: "nowrap" }}>
+                          <b>{dateLabel(e.date, { day: "numeric", month: "short" })}</b>
+                          <div className="meta">{e.startTime ?? dateLabel(e.date, { weekday: "short" })}</div>
+                        </td>
                         <td style={{ whiteSpace: "nowrap" }}><div className="who"><Avatar name={memberName(e)} sm /><b>{memberName(e)}</b></div></td>
-                        <td style={{ minWidth: 200 }}><div className="desc">{e.desc}</div>{e.client && <div className="meta"><span>{e.client}</span></div>}</td>
-                        <td style={{ minWidth: 150 }}>
-                          {typeName(e)}
+                        <td style={{ minWidth: 180 }}>
+                          <div className="desc">{e.desc}</div>
+                          {(e.client || e.jobId) && (
+                            <div className="meta">
+                              {e.client && <span>{e.client}</span>}
+                              {e.jobId && (
+                                <span className="pill" data-tip={jobById.get(e.jobId) ? `Shared card · ${fmt(jobById.get(e.jobId)!.points)} pts split by time spent` : undefined}>
+                                  <Icon name="layers" size={11} />
+                                  {jobById.get(e.jobId)?.title ?? "Job card"}
+                                  {e.share !== undefined && ` · ${Math.round(e.share * 100)}%`}
+                                </span>
+                              )}
+                            </div>
+                          )}
+                        </td>
+                        <td style={{ minWidth: 120, maxWidth: 170 }}>
+                          <div className="desc">{typeName(e)}</div>
                           <div className="meta">
-                            <span className="tag">{e.dept}</span>
-                            {r?.group === UIUX && <span className="tag">UI/UX</span>}
+                            <span className="tag">{r?.group === UIUX ? "UI/UX" : e.dept}</span>
                             {!r && <span className="pill warn">Rate removed</span>}
                           </div>
                         </td>
-                        <td className="num">{fmt(e.qty)}</td>
-                        <td className="num"><b>{fmt(pts(e))}</b></td>
-                        <td className="num muted">{e.hours ?? "—"}</td>
+                        <td className="num">{e.masked ? <span className="muted">—</span> : fmt(e.qty)}</td>
+                        <td className="num">
+                          {e.masked ? <span className="muted" data-tip="Points stay with the person and the administrator">—</span> : <b>{fmt(pts(e))}</b>}
+                          {isPending(e) && <div className="meta" style={{ justifyContent: "flex-end" }} data-tip="The job card needs confirming before these points count"><span className="pill warn">+{fmt(pendingPointsOf(e))} pending</span></div>}
+                        </td>
+                        <td className="num muted">{e.hours == null ? "—" : hoursInput(e.hours)}</td>
                         <td><StatusPill status={e.status} /></td>
-                        <td className="act"><EntryActions entry={e} /></td>
+                        <td style={{ whiteSpace: "nowrap" }} className="muted" data-tip={`Logged ${stampLabel(e.createdAt)}${e.updatedAt !== e.createdAt ? `\nEdited ${stampLabel(e.updatedAt)}` : ""}`}>
+                          {lagLabel(e)}{e.updatedAt !== e.createdAt && <div className="meta">edited</div>}
+                        </td>
+                        {/* A colleague's entry is there to be read, not edited or repeated as your own. */}
+                        <td className="act">{e.masked ? null : <EntryActions entry={e} />}</td>
                       </tr>
                     );
                   })}

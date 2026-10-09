@@ -1,5 +1,6 @@
+import type { Insight, InsightStats, PeriodKind, TeamInsight, TeamStats } from "./insights";
 import type { Role } from "./session";
-import type { AccountInfo, Bootstrap, Entry, Member, Rate, Status } from "./types";
+import type { AccountInfo, Bootstrap, Entry, Job, Member, Rate, Status } from "./types";
 
 export class ApiError extends Error {
   status: number;
@@ -31,6 +32,10 @@ async function req<T>(method: string, url: string, body?: unknown): Promise<T> {
   return data as T;
 }
 
+export type TeamSummary = {
+  month: string; points: number; target: number; entries: number; hours: number; activeMembers: number; contributors: number;
+};
+
 export type EntryDraft = {
   date: string;
   memberId: string;
@@ -38,12 +43,16 @@ export type EntryDraft = {
   desc: string;
   client: string;
   qty: number;
-  hours: number | null;
+  hours: number;
+  startTime: string;
+  jobId?: string;
   status: Status;
 };
 
 export const api = {
   bootstrap: () => req<Bootstrap>("GET", "/api/bootstrap"),
+  summary: (month: string) => req<TeamSummary>("GET", `/api/summary?month=${month}`),
+  joinable: (from: string, to: string) => req<{ entries: Entry[] }>("GET", `/api/joinable?from=${from}&to=${to}`),
   entries: (month: string) => req<{ entries: Entry[] }>("GET", `/api/entries?month=${month}`),
   createEntry: (d: EntryDraft & { id?: string }) => req<Entry>("POST", "/api/entries", d),
   updateEntry: (id: string, d: EntryDraft & { prevMonth: string }) => req<Entry>("PUT", `/api/entries/${id}`, d),
@@ -54,11 +63,34 @@ export const api = {
   createRate: (r: Partial<Rate> & Pick<Rate, "dept" | "type" | "rate">) => req<Rate>("POST", "/api/rates", r),
   updateRate: (id: string, patch: Partial<Omit<Rate, "id" | "order">>) => req<Rate>("PATCH", `/api/rates/${id}`, patch),
   deleteRate: (id: string) => req<unknown>("DELETE", `/api/rates/${id}`),
+  jobs: (status?: "Open" | "Done") => req<{ jobs: Job[] }>("GET", `/api/jobs${status ? `?status=${status}` : ""}`),
+  createJob: (j: { title: string; client?: string; typeId: string; qty?: number }) => req<Job>("POST", "/api/jobs", j),
+  cardFromEntry: (entryId: string, month: string) => req<Job>("POST", "/api/jobs/from-entry", { entryId, month }),
+  updateJob: (id: string, patch: Partial<Pick<Job, "title" | "client" | "typeId" | "qty" | "status" | "confirmed">>) => req<Job>("PATCH", `/api/jobs/${id}`, patch),
+  deleteJob: (id: string) => req<unknown>("DELETE", `/api/jobs/${id}`),
   backup: () => req<Record<string, unknown>>("GET", "/api/backup"),
   restore: (data: unknown) => req<{ team: number; rates: number; entries: number }>("POST", "/api/restore", data),
   reset: () => req<unknown>("POST", "/api/reset", { confirm: "RESET" }),
   accounts: () => req<{ accounts: AccountInfo[] }>("GET", "/api/auth/accounts"),
-  updateAccount: (b: { role: Role; email?: string; newPassword?: string; currentPassword: string }) =>
+  updateAccount: (b: { role: Role; memberId?: string; email?: string; newPassword?: string; currentPassword: string }) =>
     req<{ accounts: AccountInfo[] }>("PUT", "/api/auth/accounts", b),
-  revokeSessions: (role: Role) => req<unknown>("POST", "/api/auth/accounts/revoke", { role }),
+  revokeSessions: (role: Role, memberId?: string) => req<unknown>("POST", "/api/auth/accounts/revoke", { role, memberId }),
+  createMemberAccount: (b: { memberId: string; email: string; password: string; currentPassword: string }) =>
+    req<{ accounts: AccountInfo[] }>("POST", "/api/auth/accounts/member", b),
+  deleteMemberAccount: (b: { memberId: string; currentPassword: string }) =>
+    req<{ accounts: AccountInfo[] }>("DELETE", "/api/auth/accounts/member", b),
+
+  insight: (memberId: string, kind: PeriodKind, period: string) =>
+    req<{ insight: Insight | null }>("GET", `/api/insights?memberId=${memberId}&kind=${kind}&period=${period}`),
+  insightHistory: (memberId: string) => req<{ insights: Insight[] }>("GET", `/api/insights?memberId=${memberId}`),
+  insightStats: (memberId: string, kind: PeriodKind, period: string) =>
+    req<{ memberName: string; stats: InsightStats }>("GET", `/api/insights/stats?memberId=${memberId}&kind=${kind}&period=${period}`),
+  teamInsight: (kind: PeriodKind, period: string) =>
+    req<{ stats: TeamStats; insight: TeamInsight | null }>("GET", `/api/insights/team?kind=${kind}&period=${period}`),
+  generateTeamInsight: (b: { kind: PeriodKind; period: string; adminNote: string }) =>
+    req<{ insight: TeamInsight }>("POST", "/api/insights/team/generate", b),
+  generateInsight: (b: { memberId: string; kind: PeriodKind; period: string; adminNote: string }) =>
+    req<{ insight: Insight }>("POST", "/api/insights/generate", b),
+  publishInsight: (b: { memberId: string; kind: PeriodKind; period: string; published: boolean; employeeMessage?: string }) =>
+    req<{ insight: Insight }>("POST", "/api/insights/publish", b),
 };

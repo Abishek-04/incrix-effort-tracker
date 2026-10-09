@@ -2,8 +2,8 @@
 
 import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { api, type EntryDraft } from "@/lib/api";
-import type { Entry, Member, Rate } from "@/lib/types";
-import { todayISO } from "@/lib/utils";
+import type { Entry, Job, Member, Rate } from "@/lib/types";
+import { timeOf, todayISO } from "@/lib/utils";
 
 type MonthState = { entries: Entry[]; status: "loading" | "ready" | "error"; error?: string };
 
@@ -13,6 +13,13 @@ type DataCtx = {
   reload: () => Promise<void>;
   team: Member[];
   rates: Rate[];
+  jobs: Job[];
+  jobById: Map<string, Job>;
+  reloadJobs: () => Promise<void>;
+  addJob: (j: { title: string; client?: string; typeId: string; qty?: number }) => Promise<Job>;
+  shareEntry: (e: Entry) => Promise<Job>;
+  patchJob: (id: string, patch: Partial<Pick<Job, "title" | "client" | "typeId" | "qty" | "status" | "confirmed">>) => Promise<Job>;
+  removeJob: (id: string) => Promise<void>;
   memberById: Map<string, Member>;
   rateById: Map<string, Rate>;
   months: Record<string, MonthState>;
@@ -43,6 +50,7 @@ export function DataProvider({ children }: { children: ReactNode }) {
   const [error, setError] = useState<string | null>(null);
   const [team, setTeam] = useState<Member[]>([]);
   const [rates, setRates] = useState<Rate[]>([]);
+  const [jobs, setJobs] = useState<Job[]>([]);
   const [months, setMonths] = useState<Record<string, MonthState>>({});
   const [viewMonth, setViewMonth] = useState(() => todayISO().slice(0, 7));
   const [pending, setPending] = useState(0);
@@ -64,11 +72,20 @@ export function DataProvider({ children }: { children: ReactNode }) {
     }
   }, []);
 
+  const reloadJobs = useCallback(async () => {
+    try {
+      setJobs((await api.jobs()).jobs);
+    } catch {
+      // Job cards are optional context — a failure here shouldn't block the whole app.
+    }
+  }, []);
+
   const reload = useCallback(async () => {
     try {
       const b = await api.bootstrap();
       setTeam(b.team);
       setRates(b.rates);
+      reloadJobs();
       setError(null);
       setStatus("ready");
     } catch (e) {
@@ -97,15 +114,23 @@ export function DataProvider({ children }: { children: ReactNode }) {
     const onVisible = () => {
       if (document.visibilityState !== "visible") return;
       reload();
+      reloadJobs();
       Object.keys(monthsRef.current).forEach((m) => ensureMonth(m, true));
     };
     document.addEventListener("visibilitychange", onVisible);
     return () => document.removeEventListener("visibilitychange", onVisible);
-  }, [reload, ensureMonth]);
+  }, [reload, reloadJobs, ensureMonth]);
 
   const memberById = useMemo(() => new Map(team.map((m) => [m.id, m])), [team]);
+  const jobById = useMemo(() => new Map(jobs.map((j) => [j.id, j])), [jobs]);
   const rateById = useMemo(() => new Map(rates.map((r) => [r.id, r])), [rates]);
-  const pts = useCallback((e: Entry) => { const r = rateById.get(e.typeId); return r ? (e.qty || 1) * r.rate : 0; }, [rateById]);
+  // A contribution to a job card already carries its share of that card's points.
+  const pts = useCallback((e: Entry) => {
+    if (e.masked) return 0;
+    if (e.points !== undefined) return e.points;
+    const r = rateById.get(e.typeId);
+    return r ? (e.qty || 1) * r.rate : 0;
+  }, [rateById]);
   const memberName = useCallback((e: Entry) => memberById.get(e.memberId)?.name ?? e.memberName, [memberById]);
 
   const putLocal = useCallback((e: Entry, prevMonth?: string) => {
@@ -118,22 +143,31 @@ export function DataProvider({ children }: { children: ReactNode }) {
     });
   }, []);
 
+  /** After a job card is re-split, other people's entries changed too — reload what's on screen. */
+  const refreshShared = useCallback(() => {
+    reloadJobs();
+    Object.keys(monthsRef.current).forEach((m) => ensureMonth(m, true));
+  }, [reloadJobs, ensureMonth]);
+
   const saveEntry = useCallback<DataCtx["saveEntry"]>(async (d, edit) => {
     const saved = edit ? await track(api.updateEntry(edit.id, { ...d, prevMonth: edit.prevMonth })) : await track(api.createEntry(d));
     putLocal(saved, edit?.prevMonth);
+    if (saved.jobId || d.jobId) refreshShared();
     return saved;
-  }, [track, putLocal]);
+  }, [track, putLocal, refreshShared]);
 
   const removeEntry = useCallback(async (e: Entry) => {
     await track(api.deleteEntry(e.id, e.date.slice(0, 7)));
     const m = e.date.slice(0, 7);
     setMonths((s) => (s[m] ? { ...s, [m]: { ...s[m], entries: s[m].entries.filter((x) => x.id !== e.id) } } : s));
-  }, [track]);
+    if (e.jobId) refreshShared();
+  }, [track, refreshShared]);
 
   const restoreEntry = useCallback(async (e: Entry) => {
-    const saved = await track(api.createEntry({ id: e.id, date: e.date, memberId: e.memberId, typeId: e.typeId, desc: e.desc, client: e.client, qty: e.qty, hours: e.hours, status: e.status }));
+    const saved = await track(api.createEntry({ id: e.id, date: e.date, memberId: e.memberId, typeId: e.typeId, desc: e.desc, client: e.client, qty: e.qty, hours: e.hours ?? 0, startTime: e.startTime ?? timeOf(e.createdAt), jobId: e.jobId, status: e.status }));
     putLocal(saved);
-  }, [track, putLocal]);
+    if (saved.jobId) refreshShared();
+  }, [track, putLocal, refreshShared]);
 
   const addMember = useCallback<DataCtx["addMember"]>(async (m) => {
     const saved = await track(api.createMember(m));
@@ -155,6 +189,32 @@ export function DataProvider({ children }: { children: ReactNode }) {
   const removeMember = useCallback(async (m: Member) => {
     await track(api.deleteMember(m.id));
     setTeam((t) => t.filter((x) => x.id !== m.id));
+  }, [track]);
+
+  const addJob = useCallback<DataCtx["addJob"]>(async (j) => {
+    const saved = await track(api.createJob(j));
+    setJobs((list) => [saved, ...list]);
+    return saved;
+  }, [track]);
+
+  /** Turns work someone already logged into a shared card so this person can join it. */
+  const shareEntry = useCallback<DataCtx["shareEntry"]>(async (e) => {
+    const job = await track(api.cardFromEntry(e.id, e.date.slice(0, 7)));
+    setJobs((list) => [job, ...list.filter((j) => j.id !== job.id)]);
+    return job;
+  }, [track]);
+
+  const patchJob = useCallback<DataCtx["patchJob"]>(async (id, patch) => {
+    const saved = await track(api.updateJob(id, patch));
+    setJobs((list) => list.map((j) => (j.id === saved.id ? saved : j)));
+    // Changing the deliverable or closing the card re-splits it.
+    Object.keys(monthsRef.current).forEach((m) => ensureMonth(m, true));
+    return saved;
+  }, [track, ensureMonth]);
+
+  const removeJob = useCallback(async (id: string) => {
+    await track(api.deleteJob(id));
+    setJobs((list) => list.filter((j) => j.id !== id));
   }, [track]);
 
   const addRate = useCallback<DataCtx["addRate"]>(async (r) => {
@@ -197,7 +257,8 @@ export function DataProvider({ children }: { children: ReactNode }) {
   }, [track, refreshAll]);
 
   const value: DataCtx = {
-    status, error, reload, team, rates, memberById, rateById, months, ensureMonth, viewMonth, setViewMonth, pending, pts, memberName,
+    status, error, reload, team, rates, jobs, jobById, reloadJobs, addJob, shareEntry, patchJob, removeJob,
+    memberById, rateById, months, ensureMonth, viewMonth, setViewMonth, pending, pts, memberName,
     saveEntry, removeEntry, restoreEntry, addMember, patchMember, removeMember, addRate, patchRate, removeRate, restoreBackup, resetAll,
   };
   return <Ctx.Provider value={value}>{children}</Ctx.Provider>;

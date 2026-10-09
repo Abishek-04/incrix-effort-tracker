@@ -1,4 +1,4 @@
-import { requireSession } from "@/server/auth";
+import { deleteMemberAccount, requireSession } from "@/server/auth";
 import { deleteMember, updateMember } from "@/server/db";
 import { handle } from "@/server/http";
 import { readJson } from "@/server/request";
@@ -16,6 +16,9 @@ export function PATCH(req: Request, { params }: Ctx) {
 export function DELETE(_req: Request, { params }: Ctx) {
   return handle(async () => {
     await requireSession("admin");
-    return deleteMember((await params).id);
+    const { id } = await params;
+    // Their personal login goes with them, so the email can be reused.
+    await deleteMemberAccount(id);
+    return deleteMember(id);
   });
 }

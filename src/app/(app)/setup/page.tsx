@@ -1,15 +1,15 @@
 "use client";
 
-import { useCallback, useEffect, useRef, useState, type ChangeEvent, type FormEvent, type KeyboardEvent } from "react";
+import { Fragment, useCallback, useEffect, useRef, useState, type ChangeEvent, type FormEvent, type KeyboardEvent } from "react";
 import { useAuth } from "@/components/AuthProvider";
 import { useData } from "@/components/DataProvider";
 import { Icon, type IconName } from "@/components/Icon";
 import { Avatar, EmptyState, PageHead, SkeletonRows } from "@/components/ui";
 import { useUI } from "@/components/UIProvider";
 import { api } from "@/lib/api";
-import type { Role } from "@/lib/session";
+import type { Role, SharedRole } from "@/lib/session";
 import { DEPTS, ENGINEERING, UIUX, type AccountInfo, type Dept, type Member, type Rate } from "@/lib/types";
-import { fileDownload, fmt, todayISO, uniqueName } from "@/lib/utils";
+import { fileDownload, fmt, hoursInput, isHourlyRate, parseHours, todayISO, typicalHoursOf, uniqueName } from "@/lib/utils";
 
 type Tab = "team" | "rates" | "data" | "access";
 const blurOnEnter = (e: KeyboardEvent<HTMLInputElement>) => { if (e.key === "Enter") e.currentTarget.blur(); };
@@ -145,7 +145,7 @@ function RatesTab() {
   const items = rates.filter((r) => r.dept === dept);
   const groups = [...new Set(items.map((r) => r.group))];
   if (dept === "Software") [ENGINEERING, UIUX].forEach((g) => { if (!groups.includes(g)) groups.push(g); });
-  const multi = groups.length > 1, cols = multi ? 5 : 4;
+  const multi = groups.length > 1, cols = multi ? 6 : 5;
 
   const save = async (r: Rate, patch: Partial<Rate>, el?: HTMLInputElement, revert?: string) => {
     try { await patchRate(r.id, patch); } catch (e) { if (el && revert !== undefined) el.value = revert; toast(errMsg(e), { error: true }); }
@@ -155,6 +155,12 @@ function RatesTab() {
     if (v === r[key]) return;
     if (key === "type" && !v) { el.value = r.type; return toast("Work type can't be empty", { error: true }); }
     save(r, { [key]: v }, el, r[key]);
+  };
+  const commitTypical = (r: Rate, el: HTMLInputElement) => {
+    const v = el.value.trim();
+    const typical = v === "" ? 0 : parseHours(v);
+    if (typical === null) { el.value = r.typicalHours ? hoursInput(r.typicalHours) : ""; return toast("Try 45m, 2h30 or 3", { error: true }); }
+    if (typical !== (r.typicalHours ?? 0)) save(r, { typicalHours: typical }, el, r.typicalHours ? hoursInput(r.typicalHours) : "");
   };
   const commitRate = (r: Rate, el: HTMLInputElement) => {
     const v = Number(el.value);
@@ -192,12 +198,15 @@ function RatesTab() {
         <div className="card-h">
           <div>
             <h2>{dept} rate card</h2>
-            <p>{items.length} work types{multi ? ` in ${groups.length} groups — ${groups.map((g) => g || "General").join(" & ")}` : ""}. Renaming a work type updates it everywhere.</p>
+            <p>
+              {items.length} work types{multi ? ` in ${groups.length} groups — ${groups.map((g) => g || "General").join(" & ")}` : ""}. Renaming a work type updates it everywhere.
+              Typical time is what the work takes when done properly — logging far less than it flags the entry for review.
+            </p>
           </div>
         </div>
         <div className="tablewrap">
           <table className="t setup">
-            <thead><tr><th>Work type</th><th>Unit</th><th className="num">Points</th>{multi && <th>Group</th>}<th className="act"><span className="sr">Actions</span></th></tr></thead>
+            <thead><tr><th>Work type</th><th>Unit</th><th className="num">Points</th><th className="num">Typical time</th>{multi && <th>Group</th>}<th className="act"><span className="sr">Actions</span></th></tr></thead>
             {groups.map((g) => {
               const inGroup = items.filter((r) => r.group === g);
               return (
@@ -216,6 +225,14 @@ function RatesTab() {
                       <td style={{ minWidth: 260 }}><input key={r.type} data-rate-type={r.id} defaultValue={r.type} aria-label="Work type" onBlur={(e) => commitText(r, "type", e.currentTarget)} onKeyDown={blurOnEnter} /></td>
                       <td style={{ minWidth: 140 }}><input key={r.unit} defaultValue={r.unit} aria-label="Unit" onBlur={(e) => commitText(r, "unit", e.currentTarget)} onKeyDown={blurOnEnter} /></td>
                       <td className="num"><input key={r.rate} type="number" min={0} step={0.5} defaultValue={r.rate} aria-label="Points" onBlur={(e) => commitRate(r, e.currentTarget)} onKeyDown={blurOnEnter} /></td>
+                      <td className="num" style={{ minWidth: 110 }}>
+                        {isHourlyRate(r) ? (
+                          <span className="muted" style={{ fontSize: 12.5 }} data-tip="Paid by the clock — the time logged is the quantity">by the clock</span>
+                        ) : (
+                          <input key={r.typicalHours} defaultValue={r.typicalHours ? hoursInput(r.typicalHours) : ""} placeholder={hoursInput(typicalHoursOf(r) ?? 0)}
+                            aria-label="Typical time" data-tip="Roughly how long this takes when done properly" onBlur={(e) => commitTypical(r, e.currentTarget)} onKeyDown={blurOnEnter} />
+                        )}
+                      </td>
                       {multi && (
                         <td style={{ minWidth: 160 }}>
                           <select value={r.group} onChange={(e) => save(r, { group: e.target.value })} aria-label="Group">
@@ -318,8 +335,8 @@ function DataTab() {
 }
 
 /* ---------------- Access & security ---------------- */
-const ACCOUNT_META: Record<Role, { title: string; icon: IconName; desc: string }> = {
-  admin: { title: "Administrator login", icon: "shield", desc: "Full access, including Setup, backups and these security settings." },
+const ACCOUNT_META: Record<SharedRole, { title: string; icon: IconName; desc: string }> = {
+  admin: { title: "Administrator login", icon: "shield", desc: "Full access, including Setup, insights, backups and these security settings." },
   team: { title: "Team login", icon: "users", desc: "Shared by the team to log work and view the dashboard, daily grid and entries. Can't open Setup." },
 };
 
@@ -363,6 +380,7 @@ function AccessTab() {
           <AccountCard key={role} role={role} account={accounts.find((a) => a.role === role)} onSaved={setAccounts} />
         ))}
       </div>
+      <MemberLogins accounts={accounts} onSaved={setAccounts} />
       <div className="card tipcard" style={{ padding: "18px 22px" }}>
         <h3><Icon name="lock" size={16} />How sign-in is protected</h3>
         <ul>
@@ -371,13 +389,14 @@ function AccessTab() {
           <li>Changing a login&apos;s email or password signs out every device using it.</li>
           <li>After 8 wrong passwords in 15 minutes, sign-in for that email pauses for 15 minutes.</li>
           <li>Passwords are stored as salted scrypt hashes, so nobody (administrators included) can see them.</li>
+          <li>A personal login only sees its owner&apos;s entries and the insights you have shared with them — never a colleague&apos;s.</li>
         </ul>
       </div>
     </div>
   );
 }
 
-function AccountCard({ role, account, onSaved }: { role: Role; account?: AccountInfo; onSaved: (a: AccountInfo[]) => void }) {
+function AccountCard({ role, account, onSaved }: { role: SharedRole; account?: AccountInfo; onSaved: (a: AccountInfo[]) => void }) {
   const { user } = useAuth();
   const { toast, confirm } = useUI();
   const meta = ACCOUNT_META[role];
@@ -508,5 +527,184 @@ function AccountCard({ role, account, onSaved }: { role: Role; account?: Account
         </form>
       )}
     </div>
+  );
+}
+
+/* ---------------- Personal team logins ---------------- */
+function MemberLogins({ accounts, onSaved }: { accounts: AccountInfo[]; onSaved: (a: AccountInfo[]) => void }) {
+  const { team } = useData();
+  const { toast, confirm } = useUI();
+  const [openId, setOpenId] = useState<string | null>(null);
+
+  const byMember = new Map(accounts.filter((a) => a.role === "member" && a.memberId).map((a) => [a.memberId as string, a]));
+  const list = team.filter((m) => m.active || byMember.has(m.id));
+  const withLogin = list.filter((m) => byMember.has(m.id)).length;
+
+  const revoke = async (m: Member) => {
+    const ok = await confirm({
+      title: `Sign out ${m.name}'s devices?`,
+      body: `Every device signed in as ${m.name} will be signed out and will need the password again.`,
+      ok: "Sign out devices", icon: "logout",
+    });
+    if (!ok) return;
+    try {
+      await api.revokeSessions("member", m.id);
+      toast(`${m.name}'s devices signed out`);
+    } catch (e) { toast(errMsg(e), { error: true }); }
+  };
+
+  return (
+    <div className="card">
+      <div className="card-h">
+        <div>
+          <h2>Personal team logins</h2>
+          <p>
+            One login per person. They can log their own work, see their own entries and read the insights you share with them —
+            not the team dashboard, the daily grid or anyone else&apos;s records. The shared team login keeps working alongside these.
+          </p>
+        </div>
+        <span className="pill">{withLogin} of {list.length}</span>
+      </div>
+      {list.length ? (
+        <div className="tablewrap">
+          <table className="t setup">
+            <thead><tr><th>Member</th><th>Sign-in email</th><th>Status</th><th className="act"><span className="sr">Actions</span></th></tr></thead>
+            <tbody>
+              {list.map((m) => {
+                const account = byMember.get(m.id);
+                const editing = openId === m.id;
+                return (
+                  <Fragment key={m.id}>
+                    <tr style={{ opacity: m.active ? 1 : 0.6 }}>
+                      <td><div className="namecell"><Avatar name={m.name} sm /><b style={{ fontWeight: 600 }}>{m.name}</b></div></td>
+                      <td className="muted">{account?.email ?? "No login yet"}</td>
+                      <td>
+                        {account
+                          ? <span className="pill ok"><Icon name="checkc" size={12} />Can sign in</span>
+                          : <span className="pill"><Icon name="lock" size={12} />No access</span>}
+                      </td>
+                      <td className="act" style={{ whiteSpace: "nowrap" }}>
+                        {account && <button className="iconbtn" onClick={() => revoke(m)} data-tip="Sign out their devices" aria-label={`Sign out ${m.name}'s devices`}><Icon name="logout" size={16} /></button>}
+                        <button className="btn ghost sm" onClick={() => setOpenId(editing ? null : m.id)}>
+                          <Icon name={account ? "key" : "plus"} size={14} />{editing ? "Close" : account ? "Change" : "Create login"}
+                        </button>
+                      </td>
+                    </tr>
+                    {editing && (
+                      <tr>
+                        <td colSpan={4} style={{ background: "var(--surface-2)" }}>
+                          <MemberLoginForm member={m} account={account} onSaved={(a) => { onSaved(a); setOpenId(null); }} onCancel={() => setOpenId(null)} />
+                        </td>
+                      </tr>
+                    )}
+                  </Fragment>
+                );
+              })}
+            </tbody>
+          </table>
+        </div>
+      ) : (
+        <EmptyState icon="users" title="No team members yet">Add members on the Team members tab first.</EmptyState>
+      )}
+    </div>
+  );
+}
+
+function MemberLoginForm({ member, account, onSaved, onCancel }: {
+  member: Member; account?: AccountInfo; onSaved: (a: AccountInfo[]) => void; onCancel: () => void;
+}) {
+  const { toast, confirm } = useUI();
+  const [email, setEmail] = useState(account?.email ?? "");
+  const [pw, setPw] = useState("");
+  const [current, setCurrent] = useState("");
+  const [show, setShow] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const strength = scorePassword(pw);
+
+  const submit = async (e: FormEvent) => {
+    e.preventDefault();
+    const value = email.trim().toLowerCase();
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(value)) return setError("Enter a valid email address");
+    const emailChanged = !account || value !== account.email;
+    if (account && !emailChanged && !pw) return setError("Change the email or set a new password");
+    if (!account && !pw) return setError("Set a first password for this login");
+    if (pw && (pw.length < 10 || !/[a-zA-Z]/.test(pw) || !/\d/.test(pw))) return setError("Password must be at least 10 characters with letters and numbers");
+    if (!current) return setError("Enter your administrator password to confirm");
+    setBusy(true);
+    setError(null);
+    try {
+      const r = account
+        ? await api.updateAccount({ role: "member", memberId: member.id, email: emailChanged ? value : undefined, newPassword: pw || undefined, currentPassword: current })
+        : await api.createMemberAccount({ memberId: member.id, email: value, password: pw, currentPassword: current });
+      onSaved(r.accounts);
+      toast(account ? `${member.name}'s login updated — their devices were signed out` : `Login created for ${member.name} · share the password with them`);
+    } catch (err) {
+      setError(errMsg(err));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const remove = async () => {
+    if (!current) return setError("Enter your administrator password to confirm");
+    const ok = await confirm({
+      title: `Remove ${member.name}'s login?`,
+      body: "They won't be able to sign in personally any more. Their entries and insights are kept, and you can create the login again later.",
+      ok: "Remove login", icon: "trash",
+    });
+    if (!ok) return;
+    setBusy(true);
+    try {
+      const r = await api.deleteMemberAccount({ memberId: member.id, currentPassword: current });
+      onSaved(r.accounts);
+      toast(`${member.name}'s login removed`);
+    } catch (err) {
+      setError(errMsg(err));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <form onSubmit={submit} noValidate className="loginform">
+      <div>
+        <label className="lbl" htmlFor={`ml-email-${member.id}`}>Sign-in email</label>
+        <input id={`ml-email-${member.id}`} type="email" autoComplete="off" autoCapitalize="none" spellCheck={false}
+          value={email} onChange={(e) => setEmail(e.target.value)} placeholder="name@incrix.com" />
+      </div>
+      <div>
+        <label className="lbl" htmlFor={`ml-pw-${member.id}`}>
+          {account ? "New password " : "First password "}<span className="muted">{account ? "leave blank to keep the current one" : "share it with them privately"}</span>
+        </label>
+        <div className="pwwrap">
+          <input id={`ml-pw-${member.id}`} type={show ? "text" : "password"} autoComplete="new-password" value={pw} onChange={(e) => setPw(e.target.value)} />
+          <button type="button" className="iconbtn" onClick={() => setShow((v) => !v)} aria-label={show ? "Hide password" : "Show password"} aria-pressed={show}>
+            <Icon name={show ? "eyeOff" : "eye"} size={16} />
+          </button>
+        </div>
+        {pw && (
+          <>
+            <div className="strength"><i style={{ width: `${(strength.score / 5) * 100}%`, background: strength.color }} /></div>
+            <div className="help">{strength.label} · at least 10 characters with letters and numbers</div>
+          </>
+        )}
+      </div>
+      <div>
+        <label className="lbl" htmlFor={`ml-cur-${member.id}`}>Your administrator password <span className="req">*</span></label>
+        <input id={`ml-cur-${member.id}`} type="password" autoComplete="current-password" value={current} onChange={(e) => setCurrent(e.target.value)} />
+      </div>
+      {error && <div className="auth-alert err" role="alert" style={{ gridColumn: "1/-1" }}><Icon name="alert" size={16} />{error}</div>}
+      <div className="loginform-f">
+        <button type="submit" className={`btn${busy ? " busy" : ""}`} disabled={busy}>
+          <Icon name="check" size={16} />{account ? "Save changes" : "Create login"}
+        </button>
+        <button type="button" className="btn ghost" onClick={onCancel} disabled={busy}>Cancel</button>
+        <div className="spacer" />
+        {account && (
+          <button type="button" className="btn danger-sec" onClick={remove} disabled={busy}><Icon name="trash" size={16} />Remove login</button>
+        )}
+      </div>
+    </form>
   );
 }

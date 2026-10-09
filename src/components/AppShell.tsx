@@ -3,26 +3,48 @@
 import Link from "next/link";
 import { usePathname } from "next/navigation";
 import { useEffect, useState, type ReactNode } from "react";
+import { initials } from "@/lib/utils";
 import { useAuth } from "./AuthProvider";
 import { useData } from "./DataProvider";
 import { Icon, type IconName } from "./Icon";
 
-const WORKSPACE: { href: string; label: string; icon: IconName }[] = [
+type NavItem = { href: string; label: string; icon: IconName };
+const WORKSPACE: NavItem[] = [
   { href: "/log", label: "Log work", icon: "log" },
   { href: "/dashboard", label: "Dashboard", icon: "dash" },
   { href: "/grid", label: "Daily grid", icon: "grid" },
   { href: "/entries", label: "Entries", icon: "entries" },
+  { href: "/jobs", label: "Job cards", icon: "layers" },
 ];
-const ADMIN: typeof WORKSPACE = [{ href: "/setup", label: "Setup", icon: "setup" }];
+/** A personal login sees its own work and its own progress — not the team person by person. */
+const MEMBER_WORKSPACE: NavItem[] = [
+  { href: "/log", label: "Log work", icon: "log" },
+  { href: "/dashboard", label: "My progress", icon: "dash" },
+  { href: "/entries", label: "My entries", icon: "entries" },
+  { href: "/jobs", label: "Job cards", icon: "layers" },
+  { href: "/my-insights", label: "My insights", icon: "spark" },
+];
+/** The shared login could be anyone, so it logs work and sees totals — never a person's figures. */
+const SHARED_WORKSPACE: NavItem[] = [
+  { href: "/log", label: "Log work", icon: "log" },
+  { href: "/dashboard", label: "Studio progress", icon: "dash" },
+  { href: "/jobs", label: "Job cards", icon: "layers" },
+];
+const ADMIN: NavItem[] = [
+  { href: "/insights", label: "Insights", icon: "spark" },
+  { href: "/setup", label: "Setup", icon: "setup" },
+];
 
 export function AppShell({ children }: { children: ReactNode }) {
   const pathname = usePathname();
-  const { status, error, reload, pending, months, viewMonth } = useData();
-  const { user, isAdmin, signOut } = useAuth();
+  const { status, error, reload, pending, months, viewMonth, team } = useData();
+  const { user, isAdmin, isMember, signOut } = useAuth();
   const [navOpen, setNavOpen] = useState(false);
   const [theme, setTheme] = useState<"light" | "dark" | null>(null);
 
-  const current = [...WORKSPACE, ...ADMIN].find((n) => pathname.startsWith(n.href));
+  const workspace = isMember ? MEMBER_WORKSPACE : isAdmin ? WORKSPACE : SHARED_WORKSPACE;
+  // Every page, so the breadcrumb and tab title still name a page the current role can't navigate to.
+  const current = [...workspace, ...WORKSPACE, ...MEMBER_WORKSPACE, ...ADMIN].find((n) => pathname.startsWith(n.href));
 
   useEffect(() => setNavOpen(false), [pathname]);
   useEffect(() => { document.title = `${current?.label ?? "Home"} · Incrix Effort Tracker`; }, [current]);
@@ -41,8 +63,9 @@ export function AppShell({ children }: { children: ReactNode }) {
     setTheme(next);
   };
 
+  const memberName = isMember ? team.find((m) => m.id === user.memberId)?.name : undefined;
   const count = months[viewMonth]?.status === "ready" ? months[viewMonth].entries.length : null;
-  const navLink = (n: (typeof WORKSPACE)[number]) => {
+  const navLink = (n: NavItem) => {
     const on = pathname.startsWith(n.href);
     return (
       <Link key={n.href} href={n.href} className={`navbtn${on ? " on" : ""}`} aria-current={on ? "page" : undefined}>
@@ -59,7 +82,7 @@ export function AppShell({ children }: { children: ReactNode }) {
         <div className="brand"><div className="logo">IX</div><div><b>Incrix</b><small>Effort Tracker</small></div></div>
         <div className="navlabel">Workspace</div>
         <nav style={{ display: "grid", gap: 2 }}>
-          {WORKSPACE.map(navLink)}
+          {workspace.map(navLink)}
           {isAdmin && (
             <>
               <div className="navlabel">Administration</div>
@@ -76,10 +99,10 @@ export function AppShell({ children }: { children: ReactNode }) {
           </div>
         </div>
         <div className="userbox">
-          <span className="av sm" aria-hidden="true">{isAdmin ? "AD" : "TM"}</span>
+          <span className="av sm" aria-hidden="true">{isAdmin ? "AD" : isMember ? initials(memberName ?? user.email) : "TM"}</span>
           <div className="meta2">
-            <b title={user.email}>{user.email}</b>
-            <span className="rolepill">{isAdmin ? "Administrator" : "Team"}</span>
+            <b title={user.email}>{isMember ? (memberName ?? user.email) : user.email}</b>
+            <span className="rolepill">{isAdmin ? "Administrator" : isMember ? "Personal login" : "Team"}</span>
           </div>
           <button className="iconbtn" onClick={signOut} aria-label="Sign out" data-tip="Sign out"><Icon name="logout" size={16} /></button>
         </div>

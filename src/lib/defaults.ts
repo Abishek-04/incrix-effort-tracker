@@ -60,5 +60,9 @@ export function defaultTeam(): Member[] {
 }
 
 export function defaultRates(): Rate[] {
-  return RATES.map(([dept, type, unit, rate, group], order) => ({ id: crypto.randomUUID(), dept, type, unit, rate, group: group ?? "", order }));
+  return RATES.map(([dept, type, unit, rate, group], order) => ({
+    id: crypto.randomUUID(), dept, type, unit, rate, group: group ?? "", order,
+    // Left unset: typicalHoursOf() derives one for production work and leaves outcome-priced
+    // work (deals, leads, meetings) without an expectation, because time says nothing about those.
+  }));
 }

@@ -3,8 +3,8 @@
 import { createContext, useCallback, useContext, type ReactNode } from "react";
 import type { Role } from "@/lib/session";
 
-export type User = { role: Role; email: string };
-type AuthCtx = { user: User; isAdmin: boolean; signOut: () => Promise<void> };
+export type User = { role: Role; email: string; memberId?: string };
+type AuthCtx = { user: User; isAdmin: boolean; isMember: boolean; signOut: () => Promise<void> };
 
 const Ctx = createContext<AuthCtx | null>(null);
 
@@ -16,7 +16,7 @@ export function AuthProvider({ user, children }: { user: User; children: ReactNo
       window.location.assign("/login");
     }
   }, []);
-  return <Ctx.Provider value={{ user, isAdmin: user.role === "admin", signOut }}>{children}</Ctx.Provider>;
+  return <Ctx.Provider value={{ user, isAdmin: user.role === "admin", isMember: user.role === "member", signOut }}>{children}</Ctx.Provider>;
 }
 
 export function useAuth() {
